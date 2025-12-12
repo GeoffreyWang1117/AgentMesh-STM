@@ -1,0 +1,32 @@
+# Core dependencies
+tree-sitter>=0.21.0
+tree-sitter-python>=0.21.0
+tree-sitter-javascript>=0.21.0
+tree-sitter-java>=0.21.0
+libcst>=1.1.0
+
+# LLM integrations
+openai>=1.0.0
+anthropic>=0.18.0
+
+# Storage
+aiosqlite>=0.19.0
+lmdb>=1.4.0
+
+# Utilities
+pydantic>=2.0.0
+structlog>=23.1.0
+tenacity>=8.2.0
+gitpython>=3.1.0
+aiofiles>=23.2.0
+
+# Evaluation datasets
+datasets>=2.14.0
+
+# Development dependencies
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+mypy>=1.5.0
+ruff>=0.1.0
+black>=23.9.0
