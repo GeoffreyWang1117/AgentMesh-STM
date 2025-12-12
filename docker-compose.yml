@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  # Main AgentMesh-STM service
+  agentmesh:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentmesh-stm
+    environment:
+      - AGENTMESH_LOG_LEVEL=INFO
+      - AGENTMESH_STORAGE_BACKEND=sqlite
+      - AGENTMESH_STORAGE_PATH=/app/data/agentmesh.db
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      - agentmesh-data:/app/data
+      - agentmesh-wal:/app/wal
+      - ./workspace:/app/workspace
+      - ./plugins:/app/plugins
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    networks:
+      - agentmesh-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import agentmesh_stm"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Distributed coordinator node 1
+  coordinator-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentmesh-coordinator-1
+    command: ["coordinator", "--host", "0.0.0.0", "--port", "9001"]
+    environment:
+      - AGENTMESH_NODE_ID=coordinator-1
+      - AGENTMESH_LOG_LEVEL=INFO
+    volumes:
+      - coordinator-1-data:/app/data
+    ports:
+      - "9001:9001"
+    networks:
+      - agentmesh-network
+    profiles:
+      - distributed
+
+  # Distributed coordinator node 2
+  coordinator-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentmesh-coordinator-2
+    command: ["coordinator", "--host", "0.0.0.0", "--port", "9002"]
+    environment:
+      - AGENTMESH_NODE_ID=coordinator-2
+      - AGENTMESH_LOG_LEVEL=INFO
+    volumes:
+      - coordinator-2-data:/app/data
+    ports:
+      - "9002:9002"
+    networks:
+      - agentmesh-network
+    profiles:
+      - distributed
+
+  # Development service with hot reload
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    container_name: agentmesh-dev
+    environment:
+      - AGENTMESH_LOG_LEVEL=DEBUG
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      - .:/app
+      - dev-data:/app/data
+    ports:
+      - "8080:8080"
+    networks:
+      - agentmesh-network
+    profiles:
+      - development
+    command: ["python", "-m", "pytest", "-v", "--watch"]
+
+  # Benchmark runner
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agentmesh-benchmark
+    command: ["benchmark", "--output", "/app/data/benchmark_results.json"]
+    environment:
+      - AGENTMESH_LOG_LEVEL=INFO
+    volumes:
+      - benchmark-data:/app/data
+    networks:
+      - agentmesh-network
+    profiles:
+      - benchmark
+
+volumes:
+  agentmesh-data:
+    driver: local
+  agentmesh-wal:
+    driver: local
+  coordinator-1-data:
+    driver: local
+  coordinator-2-data:
+    driver: local
+  dev-data:
+    driver: local
+  benchmark-data:
+    driver: local
+
+networks:
+  agentmesh-network:
+    driver: bridge

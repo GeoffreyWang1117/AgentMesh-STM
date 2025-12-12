@@ -118,6 +118,37 @@ def create_parser() -> argparse.ArgumentParser:
         help="Overwrite existing configuration",
     )
 
+    # Server command
+    server_parser = subparsers.add_parser(
+        "server",
+        help="Start the REST API server",
+    )
+    server_parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host to bind to (default: 0.0.0.0)",
+    )
+    server_parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port to listen on (default: 8080)",
+    )
+    server_parser.add_argument(
+        "--storage",
+        choices=["memory", "sqlite"],
+        default="memory",
+        help="Storage backend (default: memory)",
+    )
+    server_parser.add_argument(
+        "--storage-path",
+        help="Path for persistent storage (required for sqlite)",
+    )
+    server_parser.add_argument(
+        "--api-key",
+        help="API key for authentication (optional)",
+    )
+
     return parser
 
 
@@ -436,6 +467,38 @@ def run_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+async def run_server_cmd(args: argparse.Namespace) -> int:
+    """Start the REST API server."""
+    try:
+        from agentmesh_stm.api.server import run_server, APIConfig
+    except ImportError as e:
+        print(f"Error: {e}")
+        print("Install aiohttp to use the API server: pip install aiohttp")
+        return 1
+
+    config = APIConfig(
+        host=args.host,
+        port=args.port,
+        storage_backend=args.storage,
+        storage_path=args.storage_path,
+        api_key=args.api_key,
+    )
+
+    print(f"Starting AgentMesh-STM API server...")
+    print(f"  Host: {config.host}")
+    print(f"  Port: {config.port}")
+    print(f"  Storage: {config.storage_backend}")
+    if config.api_key:
+        print(f"  Authentication: enabled")
+
+    try:
+        await run_server(config)
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+
+    return 0
+
+
 def cli(args: Optional[List[str]] = None) -> int:
     """Main CLI entry point."""
     parser = create_parser()
@@ -455,6 +518,8 @@ def cli(args: Optional[List[str]] = None) -> int:
         return run_init(parsed_args)
     elif parsed_args.command == "metrics":
         return run_metrics(parsed_args)
+    elif parsed_args.command == "server":
+        return asyncio.run(run_server_cmd(parsed_args))
 
     return 0
 
