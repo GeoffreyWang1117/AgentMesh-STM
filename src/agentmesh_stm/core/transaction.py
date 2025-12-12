@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from agentmesh_stm.storage.mvcc import MVCCStorage
     from agentmesh_stm.conflict.detector import ConflictDetector
     from agentmesh_stm.compensation.manager import CompensationManager
+    from agentmesh_stm.core.logging import TransactionLogger
 
 
 class TransactionState(Enum):
@@ -571,11 +572,13 @@ class TransactionManager:
         conflict_detector: Optional["ConflictDetector"] = None,
         compensation_manager: Optional["CompensationManager"] = None,
         default_config: Optional[TransactionConfig] = None,
+        transaction_logger: Optional["TransactionLogger"] = None,
     ):
         self._storage = storage
         self._conflict_detector = conflict_detector
         self._compensation_manager = compensation_manager
         self._default_config = default_config or TransactionConfig()
+        self._transaction_logger = transaction_logger
         self._active_transactions: Dict[str, Transaction] = {}
         self._lock = asyncio.Lock()
 
@@ -629,19 +632,40 @@ class TransactionManager:
             try:
                 await txn.begin()
 
+                # Log transaction begin
+                if self._transaction_logger:
+                    await self._transaction_logger.on_transaction_begin(txn.id)
+
                 # Execute the user function
                 if asyncio.iscoroutinefunction(func):
                     result = await func(txn)
                 else:
                     result = func(txn)
 
+                # Log writes before commit
+                if self._transaction_logger:
+                    for entry in txn.write_set.get_all():
+                        await self._transaction_logger.on_write(
+                            txn.id,
+                            entry.resource_id,
+                            entry.old_content,
+                            entry.new_content,
+                        )
+
                 # Try to commit
                 if await txn.commit():
+                    # Log commit
+                    if self._transaction_logger:
+                        await self._transaction_logger.on_transaction_commit(txn.id)
+
                     async with self._lock:
                         self._active_transactions.pop(txn.id, None)
                     return result
 
-                # Commit failed due to conflict
+                # Commit failed due to conflict, log abort
+                if self._transaction_logger:
+                    await self._transaction_logger.on_transaction_abort(txn.id)
+
                 retry_count += 1
                 if retry_count <= max_retries:
                     await asyncio.sleep(txn.config.retry_delay_ms / 1000.0)
@@ -650,12 +674,19 @@ class TransactionManager:
                     txn._state = TransactionState.RETRYING
 
             except Exception as e:
+                # Log abort on exception
+                if self._transaction_logger:
+                    await self._transaction_logger.on_transaction_abort(txn.id)
+
                 await txn.abort()
                 async with self._lock:
                     self._active_transactions.pop(txn.id, None)
                 raise
 
-        # Max retries exceeded
+        # Max retries exceeded, log abort
+        if self._transaction_logger:
+            await self._transaction_logger.on_transaction_abort(txn.id)
+
         await txn.abort()
         async with self._lock:
             self._active_transactions.pop(txn.id, None)
@@ -684,15 +715,40 @@ class TransactionManager:
 
         try:
             await txn.begin()
+
+            # Log transaction begin
+            if self._transaction_logger:
+                await self._transaction_logger.on_transaction_begin(txn.id)
+
             yield txn
 
             if txn.state == TransactionState.ACTIVE:
-                if not await txn.commit():
+                # Log writes before commit
+                if self._transaction_logger:
+                    for entry in txn.write_set.get_all():
+                        await self._transaction_logger.on_write(
+                            txn.id,
+                            entry.resource_id,
+                            entry.old_content,
+                            entry.new_content,
+                        )
+
+                if await txn.commit():
+                    # Log commit
+                    if self._transaction_logger:
+                        await self._transaction_logger.on_transaction_commit(txn.id)
+                else:
+                    # Log abort
+                    if self._transaction_logger:
+                        await self._transaction_logger.on_transaction_abort(txn.id)
                     await txn.abort()
                     raise TransactionError("Transaction aborted due to conflict")
 
         except Exception:
             if txn.state not in (TransactionState.COMMITTED, TransactionState.ABORTED):
+                # Log abort
+                if self._transaction_logger:
+                    await self._transaction_logger.on_transaction_abort(txn.id)
                 await txn.abort()
             raise
         finally:

@@ -19,6 +19,9 @@ structlog>=23.1.0
 tenacity>=8.2.0
 gitpython>=3.1.0
 aiofiles>=23.2.0
+pyyaml>=6.0.0
+click>=8.1.0
+rich>=13.0.0
 
 # Evaluation datasets
 datasets>=2.14.0

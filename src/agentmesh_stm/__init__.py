@@ -10,6 +10,9 @@ Core Components:
 - MVCCStorage: Multi-version concurrency control for resource versioning
 - ConflictDetector: Hierarchical semantic conflict detection
 - CompensationManager: Handles rollback of side effects
+- LLMAgent: LLM-powered agents with tool support
+- WriteAheadLog: Transaction durability and recovery
+- LLMConflictResolver: AI-powered conflict resolution
 """
 
 from agentmesh_stm.core.transaction import (
@@ -18,16 +21,25 @@ from agentmesh_stm.core.transaction import (
     TransactionManager,
     TransactionState,
 )
+from agentmesh_stm.core.logging import (
+    WriteAheadLog,
+    TransactionLogger,
+    RecoveryManager,
+)
 from agentmesh_stm.storage.mvcc import MVCCStorage, ResourceVersion
 from agentmesh_stm.conflict.detector import ConflictDetector, ConflictResult, ConflictType
+from agentmesh_stm.conflict.llm_resolver import LLMConflictResolver, MergeStrategy
 from agentmesh_stm.compensation.manager import (
     CompensationManager,
     CompensableOperation,
     CompensationLog,
 )
 from agentmesh_stm.agent.base import Agent, AgentTask, AgentResult
+from agentmesh_stm.agent.llm_agent import LLMAgent, LLMConfig
+from agentmesh_stm.config import AgentMeshConfig, load_config
+from agentmesh_stm.monitoring import MetricsCollector, create_dashboard
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     # Transaction
     "Transaction",
@@ -41,6 +53,8 @@ __all__ = [
     "ConflictDetector",
     "ConflictResult",
     "ConflictType",
+    "LLMConflictResolver",
+    "MergeStrategy",
     # Compensation
     "CompensationManager",
     "CompensableOperation",
@@ -49,4 +63,16 @@ __all__ = [
     "Agent",
     "AgentTask",
     "AgentResult",
+    "LLMAgent",
+    "LLMConfig",
+    # Durability
+    "WriteAheadLog",
+    "TransactionLogger",
+    "RecoveryManager",
+    # Configuration
+    "AgentMeshConfig",
+    "load_config",
+    # Monitoring
+    "MetricsCollector",
+    "create_dashboard",
 ]
