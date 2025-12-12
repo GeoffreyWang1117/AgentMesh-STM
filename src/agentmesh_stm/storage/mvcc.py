@@ -615,3 +615,287 @@ class MVCCStorage:
             "global_version": await self._backend.get_global_version(),
             "active_snapshots": len(self._active_snapshots),
         }
+
+
+class LMDBBackend(StorageBackend):
+    """
+    LMDB storage backend for high-performance persistence.
+
+    LMDB (Lightning Memory-Mapped Database) provides:
+    - Memory-mapped I/O for fast reads
+    - ACID transactions
+    - Multi-reader, single-writer concurrency
+    - Zero-copy reads
+    """
+
+    def __init__(
+        self,
+        path: str,
+        map_size: int = 10 * 1024 * 1024 * 1024,  # 10GB default
+        max_dbs: int = 10,
+    ):
+        """
+        Initialize LMDB backend.
+
+        Args:
+            path: Directory path for the database
+            map_size: Maximum size of the database in bytes
+            max_dbs: Maximum number of named databases
+        """
+        self._path = path
+        self._map_size = map_size
+        self._max_dbs = max_dbs
+        self._env = None
+        self._resources_db = None
+        self._versions_db = None
+        self._meta_db = None
+        self._lock = asyncio.Lock()
+        self._initialized = False
+
+    async def initialize(self) -> None:
+        """Initialize the LMDB environment and databases."""
+        if self._initialized:
+            return
+
+        import lmdb
+        import os
+
+        # Create directory if needed
+        os.makedirs(self._path, exist_ok=True)
+
+        # Open environment
+        self._env = lmdb.open(
+            self._path,
+            map_size=self._map_size,
+            max_dbs=self._max_dbs,
+            writemap=True,
+            metasync=False,
+            sync=True,
+        )
+
+        # Open named databases
+        self._resources_db = self._env.open_db(b"resources")
+        self._versions_db = self._env.open_db(b"versions")
+        self._meta_db = self._env.open_db(b"meta")
+
+        # Initialize global version if not exists
+        with self._env.begin(write=True, db=self._meta_db) as txn:
+            if txn.get(b"global_version") is None:
+                txn.put(b"global_version", b"0")
+
+        self._initialized = True
+
+    async def close(self) -> None:
+        """Close the LMDB environment."""
+        if self._env:
+            self._env.close()
+            self._env = None
+            self._initialized = False
+
+    def _serialize_resource(self, resource: VersionedResource) -> bytes:
+        """Serialize resource metadata to bytes."""
+        import json
+        data = {
+            "resource_id": resource.resource_id,
+            "current_version": resource.current_version,
+            "created_at": resource.created_at.isoformat(),
+            "updated_at": resource.updated_at.isoformat(),
+            "version_keys": list(resource.versions.keys()),
+        }
+        return json.dumps(data).encode("utf-8")
+
+    def _deserialize_resource(self, data: bytes) -> VersionedResource:
+        """Deserialize resource metadata from bytes."""
+        import json
+        parsed = json.loads(data.decode("utf-8"))
+        return VersionedResource(
+            resource_id=parsed["resource_id"],
+            current_version=parsed["current_version"],
+            created_at=datetime.fromisoformat(parsed["created_at"]),
+            updated_at=datetime.fromisoformat(parsed["updated_at"]),
+        )
+
+    def _serialize_version(self, version: ResourceVersion) -> bytes:
+        """Serialize a version to bytes."""
+        import json
+        data = {
+            "resource_id": version.resource_id,
+            "version": version.version,
+            "content": version.content,
+            "content_hash": version.content_hash,
+            "timestamp": version.timestamp.isoformat(),
+            "transaction_id": version.transaction_id,
+            "is_deleted": version.is_deleted,
+        }
+        return json.dumps(data).encode("utf-8")
+
+    def _deserialize_version(self, data: bytes) -> ResourceVersion:
+        """Deserialize a version from bytes."""
+        import json
+        parsed = json.loads(data.decode("utf-8"))
+        return ResourceVersion(
+            resource_id=parsed["resource_id"],
+            version=parsed["version"],
+            content=parsed["content"],
+            content_hash=parsed["content_hash"],
+            timestamp=datetime.fromisoformat(parsed["timestamp"]),
+            transaction_id=parsed.get("transaction_id"),
+            is_deleted=parsed.get("is_deleted", False),
+        )
+
+    def _version_key(self, resource_id: str, version: int) -> bytes:
+        """Generate key for a version entry."""
+        return f"{resource_id}:{version}".encode("utf-8")
+
+    async def get(self, resource_id: str) -> Optional[VersionedResource]:
+        """Get a versioned resource by ID."""
+        if not self._initialized:
+            await self.initialize()
+
+        resource_key = resource_id.encode("utf-8")
+
+        with self._env.begin(db=self._resources_db) as txn:
+            data = txn.get(resource_key)
+            if not data:
+                return None
+
+            resource = self._deserialize_resource(data)
+
+        # Load versions
+        with self._env.begin(db=self._versions_db) as txn:
+            cursor = txn.cursor()
+            prefix = f"{resource_id}:".encode("utf-8")
+
+            if cursor.set_range(prefix):
+                while True:
+                    key, value = cursor.item()
+                    if not key.startswith(prefix):
+                        break
+
+                    version = self._deserialize_version(value)
+                    resource.versions[version.version] = version
+
+                    if not cursor.next():
+                        break
+
+        return resource
+
+    async def put(self, resource: VersionedResource) -> None:
+        """Store or update a versioned resource."""
+        if not self._initialized:
+            await self.initialize()
+
+        async with self._lock:
+            resource_key = resource.resource_id.encode("utf-8")
+
+            with self._env.begin(write=True) as txn:
+                # Store resource metadata
+                txn.put(
+                    resource_key,
+                    self._serialize_resource(resource),
+                    db=self._resources_db,
+                )
+
+                # Store versions
+                for version in resource.versions.values():
+                    version_key = self._version_key(resource.resource_id, version.version)
+                    txn.put(
+                        version_key,
+                        self._serialize_version(version),
+                        db=self._versions_db,
+                    )
+
+    async def delete(self, resource_id: str) -> bool:
+        """Delete a resource and all its versions."""
+        if not self._initialized:
+            await self.initialize()
+
+        async with self._lock:
+            resource_key = resource_id.encode("utf-8")
+            deleted = False
+
+            with self._env.begin(write=True) as txn:
+                # Delete resource metadata
+                if txn.delete(resource_key, db=self._resources_db):
+                    deleted = True
+
+                # Delete all versions
+                cursor = txn.cursor(db=self._versions_db)
+                prefix = f"{resource_id}:".encode("utf-8")
+
+                if cursor.set_range(prefix):
+                    while True:
+                        key, _ = cursor.item()
+                        if not key.startswith(prefix):
+                            break
+                        cursor.delete()
+                        if not cursor.next():
+                            break
+
+            return deleted
+
+    async def list_resources(self) -> List[str]:
+        """List all resource IDs."""
+        if not self._initialized:
+            await self.initialize()
+
+        resources = []
+        with self._env.begin(db=self._resources_db) as txn:
+            cursor = txn.cursor()
+            for key, _ in cursor:
+                resources.append(key.decode("utf-8"))
+
+        return resources
+
+    async def get_global_version(self) -> int:
+        """Get the current global version number."""
+        if not self._initialized:
+            await self.initialize()
+
+        with self._env.begin(db=self._meta_db) as txn:
+            data = txn.get(b"global_version")
+            return int(data.decode("utf-8")) if data else 0
+
+    async def increment_global_version(self) -> int:
+        """Atomically increment and return the new global version."""
+        if not self._initialized:
+            await self.initialize()
+
+        async with self._lock:
+            with self._env.begin(write=True, db=self._meta_db) as txn:
+                data = txn.get(b"global_version")
+                current = int(data.decode("utf-8")) if data else 0
+                new_version = current + 1
+                txn.put(b"global_version", str(new_version).encode("utf-8"))
+                return new_version
+
+    async def compact(self) -> None:
+        """Compact the database to reclaim space."""
+        if not self._initialized:
+            await self.initialize()
+
+        # LMDB doesn't need explicit compaction, but we can copy to a new file
+        # This is a no-op for now
+        pass
+
+    def get_db_stats(self) -> Dict[str, Any]:
+        """Get LMDB database statistics."""
+        if not self._env:
+            return {}
+
+        stats = self._env.stat()
+        info = self._env.info()
+
+        return {
+            "page_size": stats["psize"],
+            "tree_depth": stats["depth"],
+            "branch_pages": stats["branch_pages"],
+            "leaf_pages": stats["leaf_pages"],
+            "overflow_pages": stats["overflow_pages"],
+            "entries": stats["entries"],
+            "map_size": info["map_size"],
+            "last_pgno": info["last_pgno"],
+            "last_txnid": info["last_txnid"],
+            "max_readers": info["max_readers"],
+            "num_readers": info["num_readers"],
+        }

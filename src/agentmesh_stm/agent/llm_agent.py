@@ -22,6 +22,14 @@ from agentmesh_stm.agent.base import (
     AgentResult,
     AgentTask,
 )
+from agentmesh_stm.agent.tools import (
+    CodeAnalysisTools,
+    GitTools,
+    ProjectTools,
+    ShellTools,
+    ToolResult,
+    create_tool_definitions,
+)
 from agentmesh_stm.core.transaction import Transaction, TransactionManager
 from agentmesh_stm.utils.logging import get_logger
 
@@ -92,12 +100,17 @@ class LLMAgent(Agent):
         transaction_manager: TransactionManager,
         llm_config: Optional[LLMConfig] = None,
         agent_config: Optional[AgentConfig] = None,
+        enable_advanced_tools: bool = True,
+        working_directory: str = ".",
     ):
         super().__init__(transaction_manager, agent_config)
         self._llm_config = llm_config or LLMConfig()
         self._client = None
         self._tools: Dict[str, Tool] = {}
+        self._working_directory = working_directory
         self._register_default_tools()
+        if enable_advanced_tools:
+            self._register_advanced_tools()
 
     def _register_default_tools(self) -> None:
         """Register default tools for file operations."""
@@ -189,6 +202,265 @@ class LLMAgent(Agent):
         """Register a tool for the agent to use."""
         self._tools[tool.name] = tool
         logger.debug("Tool registered", tool=tool.name, agent=self.name)
+
+    def _register_advanced_tools(self) -> None:
+        """Register advanced tools for code analysis, git, and project operations."""
+        # Code Analysis Tools
+        self.register_tool(
+            Tool(
+                name="analyze_dependencies",
+                description="Analyze imports and dependencies in a source file",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the file to analyze",
+                        },
+                        "language": {
+                            "type": "string",
+                            "enum": ["python", "javascript", "typescript"],
+                            "description": "Programming language (default: python)",
+                        },
+                    },
+                    "required": ["file_path"],
+                },
+                handler=self._tool_analyze_dependencies,
+            )
+        )
+
+        self.register_tool(
+            Tool(
+                name="find_function_definition",
+                description="Find where a function is defined in the codebase",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "function_name": {
+                            "type": "string",
+                            "description": "Name of the function to find",
+                        },
+                        "search_path": {
+                            "type": "string",
+                            "description": "Directory to search in",
+                        },
+                    },
+                    "required": ["function_name"],
+                },
+                handler=self._tool_find_function_definition,
+            )
+        )
+
+        self.register_tool(
+            Tool(
+                name="find_class_definition",
+                description="Find where a class is defined in the codebase",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "class_name": {
+                            "type": "string",
+                            "description": "Name of the class to find",
+                        },
+                        "search_path": {
+                            "type": "string",
+                            "description": "Directory to search in",
+                        },
+                    },
+                    "required": ["class_name"],
+                },
+                handler=self._tool_find_class_definition,
+            )
+        )
+
+        self.register_tool(
+            Tool(
+                name="get_function_callers",
+                description="Find all places where a function is called",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "function_name": {
+                            "type": "string",
+                            "description": "Name of the function",
+                        },
+                        "search_path": {
+                            "type": "string",
+                            "description": "Directory to search in",
+                        },
+                    },
+                    "required": ["function_name"],
+                },
+                handler=self._tool_get_function_callers,
+            )
+        )
+
+        # Git Tools
+        self.register_tool(
+            Tool(
+                name="get_git_status",
+                description="Get current Git status (staged, modified, untracked files)",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {
+                            "type": "string",
+                            "description": "Path to the repository",
+                        },
+                    },
+                },
+                handler=self._tool_git_status,
+            )
+        )
+
+        self.register_tool(
+            Tool(
+                name="get_git_diff",
+                description="Get Git diff showing changes",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {
+                            "type": "string",
+                            "description": "Path to the repository",
+                        },
+                        "staged": {
+                            "type": "boolean",
+                            "description": "Show staged changes only",
+                        },
+                        "file_path": {
+                            "type": "string",
+                            "description": "Specific file to diff",
+                        },
+                    },
+                },
+                handler=self._tool_git_diff,
+            )
+        )
+
+        self.register_tool(
+            Tool(
+                name="get_git_log",
+                description="Get recent Git commit history",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {
+                            "type": "string",
+                            "description": "Path to the repository",
+                        },
+                        "num_commits": {
+                            "type": "integer",
+                            "description": "Number of commits to show (default: 10)",
+                        },
+                        "file_path": {
+                            "type": "string",
+                            "description": "Show history for specific file",
+                        },
+                    },
+                },
+                handler=self._tool_git_log,
+            )
+        )
+
+        # Project Tools
+        self.register_tool(
+            Tool(
+                name="get_project_structure",
+                description="Get project directory structure as a tree",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "root_path": {
+                            "type": "string",
+                            "description": "Root directory",
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "description": "Maximum depth to traverse (default: 3)",
+                        },
+                    },
+                },
+                handler=self._tool_project_structure,
+            )
+        )
+
+        self.register_tool(
+            Tool(
+                name="find_files",
+                description="Find files matching a glob pattern",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "root_path": {
+                            "type": "string",
+                            "description": "Root directory",
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern (e.g., '*.py', '**/*.ts')",
+                        },
+                    },
+                    "required": ["pattern"],
+                },
+                handler=self._tool_find_files,
+            )
+        )
+
+        self.register_tool(
+            Tool(
+                name="get_file_stats",
+                description="Get statistics about a file (size, lines, etc.)",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the file",
+                        },
+                    },
+                    "required": ["file_path"],
+                },
+                handler=self._tool_file_stats,
+            )
+        )
+
+        # Shell Tools
+        self.register_tool(
+            Tool(
+                name="run_tests",
+                description="Run tests using a test framework",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "test_path": {
+                            "type": "string",
+                            "description": "Path to tests",
+                        },
+                        "test_framework": {
+                            "type": "string",
+                            "enum": ["pytest", "jest", "unittest"],
+                            "description": "Test framework to use (default: pytest)",
+                        },
+                        "verbose": {
+                            "type": "boolean",
+                            "description": "Enable verbose output",
+                        },
+                    },
+                },
+                handler=self._tool_run_tests,
+            )
+        )
+
+        logger.info(
+            "Advanced tools registered",
+            agent=self.name,
+            tools=[
+                "analyze_dependencies", "find_function_definition", "find_class_definition",
+                "get_function_callers", "get_git_status", "get_git_diff", "get_git_log",
+                "get_project_structure", "find_files", "get_file_stats", "run_tests"
+            ],
+        )
 
     async def _get_client(self) -> Any:
         """Get or create the LLM client."""
@@ -550,3 +822,156 @@ the codebase and make necessary changes."""
                     continue
 
         return results[:50]  # Limit results
+
+    # Advanced tool handlers
+    async def _tool_analyze_dependencies(
+        self,
+        transaction: Transaction,
+        file_path: str,
+        language: str = "python",
+    ) -> Dict[str, Any]:
+        """Analyze dependencies in a file."""
+        result = await CodeAnalysisTools.analyze_dependencies(
+            transaction, file_path, language
+        )
+        if result.success:
+            return {"dependencies": result.output}
+        return {"error": result.error}
+
+    async def _tool_find_function_definition(
+        self,
+        transaction: Transaction,
+        function_name: str,
+        search_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Find function definition."""
+        path = search_path or self._working_directory
+        result = await CodeAnalysisTools.find_function_definition(
+            transaction, function_name, path
+        )
+        if result.success:
+            return {"locations": result.output}
+        return {"error": result.error}
+
+    async def _tool_find_class_definition(
+        self,
+        transaction: Transaction,
+        class_name: str,
+        search_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Find class definition."""
+        path = search_path or self._working_directory
+        result = await CodeAnalysisTools.find_class_definition(
+            transaction, class_name, path
+        )
+        if result.success:
+            return {"locations": result.output}
+        return {"error": result.error}
+
+    async def _tool_get_function_callers(
+        self,
+        transaction: Transaction,
+        function_name: str,
+        search_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Find function callers."""
+        path = search_path or self._working_directory
+        result = await CodeAnalysisTools.get_function_callers(
+            transaction, function_name, path
+        )
+        if result.success:
+            return {"callers": result.output}
+        return {"error": result.error}
+
+    async def _tool_git_status(
+        self,
+        transaction: Transaction,
+        repo_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get git status."""
+        path = repo_path or self._working_directory
+        result = await GitTools.get_git_status(path)
+        if result.success:
+            return result.output
+        return {"error": result.error}
+
+    async def _tool_git_diff(
+        self,
+        transaction: Transaction,
+        repo_path: Optional[str] = None,
+        staged: bool = False,
+        file_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get git diff."""
+        path = repo_path or self._working_directory
+        result = await GitTools.get_git_diff(path, staged, file_path)
+        if result.success:
+            return {"diff": result.output}
+        return {"error": result.error}
+
+    async def _tool_git_log(
+        self,
+        transaction: Transaction,
+        repo_path: Optional[str] = None,
+        num_commits: int = 10,
+        file_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get git log."""
+        path = repo_path or self._working_directory
+        result = await GitTools.get_git_log(path, num_commits, file_path)
+        if result.success:
+            return {"commits": result.output}
+        return {"error": result.error}
+
+    async def _tool_project_structure(
+        self,
+        transaction: Transaction,
+        root_path: Optional[str] = None,
+        max_depth: int = 3,
+    ) -> Dict[str, Any]:
+        """Get project structure."""
+        path = root_path or self._working_directory
+        result = await ProjectTools.get_project_structure(path, max_depth)
+        if result.success:
+            return {"structure": result.output}
+        return {"error": result.error}
+
+    async def _tool_find_files(
+        self,
+        transaction: Transaction,
+        pattern: str,
+        root_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Find files by pattern."""
+        path = root_path or self._working_directory
+        result = await ProjectTools.find_files_by_pattern(path, pattern)
+        if result.success:
+            return {"files": result.output}
+        return {"error": result.error}
+
+    async def _tool_file_stats(
+        self,
+        transaction: Transaction,
+        file_path: str,
+    ) -> Dict[str, Any]:
+        """Get file statistics."""
+        result = await ProjectTools.get_file_stats(file_path)
+        if result.success:
+            return result.output
+        return {"error": result.error}
+
+    async def _tool_run_tests(
+        self,
+        transaction: Transaction,
+        test_path: Optional[str] = None,
+        test_framework: str = "pytest",
+        verbose: bool = False,
+    ) -> Dict[str, Any]:
+        """Run tests."""
+        path = test_path or "."
+        result = await ShellTools.run_tests(path, test_framework, verbose)
+        return {
+            "success": result.success,
+            "output": result.output,
+            "error": result.error,
+        }

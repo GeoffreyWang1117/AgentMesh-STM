@@ -55,6 +55,9 @@ transformers = [
     "torch>=2.0.0",
 ]
 
+[project.scripts]
+agentmesh-stm = "agentmesh_stm.cli.main:main"
+
 [project.urls]
 "Homepage" = "https://github.com/GeoffreyWang1117/AgentMesh-STM"
 "Bug Tracker" = "https://github.com/GeoffreyWang1117/AgentMesh-STM/issues"

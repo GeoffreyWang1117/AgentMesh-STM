@@ -5,6 +5,10 @@ from agentmesh_stm.storage.mvcc import (
     ResourceVersion,
     VersionedResource,
     StorageBackend,
+    InMemoryBackend,
+    SQLiteBackend,
+    LMDBBackend,
+    StorageBackendType,
 )
 
 __all__ = [
@@ -12,4 +16,8 @@ __all__ = [
     "ResourceVersion",
     "VersionedResource",
     "StorageBackend",
+    "InMemoryBackend",
+    "SQLiteBackend",
+    "LMDBBackend",
+    "StorageBackendType",
 ]
