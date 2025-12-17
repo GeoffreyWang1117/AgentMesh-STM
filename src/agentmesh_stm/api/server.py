@@ -6,15 +6,19 @@ Provides HTTP endpoints for:
 - Resource operations
 - Agent task execution
 - Metrics and monitoring
+- Health checks (liveness, readiness)
+- Prometheus metrics
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
 
 from agentmesh_stm.core.transaction import TransactionManager, TransactionConfig
 from agentmesh_stm.storage.mvcc import MVCCStorage, InMemoryBackend, SQLiteBackend
@@ -332,12 +336,27 @@ class MetricsAPI:
     REST API for metrics and monitoring.
 
     Endpoints:
-    - GET /api/metrics - Get current metrics
-    - GET /api/health - Health check
+    - GET /api/metrics - Get current metrics (JSON)
+    - GET /api/metrics/prometheus - Prometheus format metrics
+    - GET /api/health - Full health check
+    - GET /health - Simple health check (for load balancers)
+    - GET /healthz - Kubernetes liveness probe
+    - GET /readyz - Kubernetes readiness probe
     """
 
     def __init__(self, metrics: MetricsCollector):
         self.metrics = metrics
+        self._start_time = datetime.utcnow()
+        self._health_checks: Dict[str, Callable] = {}
+        self._ready = True
+
+    def add_health_check(self, name: str, check: Callable) -> None:
+        """Add a health check function."""
+        self._health_checks[name] = check
+
+    def set_ready(self, ready: bool) -> None:
+        """Set readiness state."""
+        self._ready = ready
 
     def get_routes(self) -> list:
         """Get the API routes."""
@@ -346,21 +365,106 @@ class MetricsAPI:
 
         return [
             web.get("/api/metrics", self.get_metrics),
+            web.get("/api/metrics/prometheus", self.get_prometheus_metrics),
             web.get("/api/health", self.health_check),
-            web.get("/health", self.health_check),
+            web.get("/health", self.simple_health),
+            web.get("/healthz", self.liveness_probe),
+            web.get("/readyz", self.readiness_probe),
         ]
 
     async def get_metrics(self, request: web.Request) -> web.Response:
-        """Get current metrics."""
+        """Get current metrics in JSON format."""
         summary = self.metrics.get_summary()
+        summary["uptime_seconds"] = (datetime.utcnow() - self._start_time).total_seconds()
         return web.json_response(summary)
 
+    async def get_prometheus_metrics(self, request: web.Request) -> web.Response:
+        """Get metrics in Prometheus format."""
+        summary = self.metrics.get_summary()
+        lines = []
+
+        # Transaction metrics
+        lines.append("# HELP agentmesh_transactions_total Total number of transactions")
+        lines.append("# TYPE agentmesh_transactions_total counter")
+        lines.append(f"agentmesh_transactions_total{{status=\"started\"}} {summary.get('transactions_started', 0)}")
+        lines.append(f"agentmesh_transactions_total{{status=\"committed\"}} {summary.get('transactions_committed', 0)}")
+        lines.append(f"agentmesh_transactions_total{{status=\"aborted\"}} {summary.get('transactions_aborted', 0)}")
+
+        # Conflict metrics
+        lines.append("# HELP agentmesh_conflicts_total Total number of conflicts")
+        lines.append("# TYPE agentmesh_conflicts_total counter")
+        lines.append(f"agentmesh_conflicts_total {summary.get('conflicts_detected', 0)}")
+
+        # Operation metrics
+        lines.append("# HELP agentmesh_operations_total Total number of operations")
+        lines.append("# TYPE agentmesh_operations_total counter")
+        lines.append(f"agentmesh_operations_total{{type=\"read\"}} {summary.get('read_operations', 0)}")
+        lines.append(f"agentmesh_operations_total{{type=\"write\"}} {summary.get('write_operations', 0)}")
+
+        # Uptime
+        uptime = (datetime.utcnow() - self._start_time).total_seconds()
+        lines.append("# HELP agentmesh_uptime_seconds Service uptime in seconds")
+        lines.append("# TYPE agentmesh_uptime_seconds gauge")
+        lines.append(f"agentmesh_uptime_seconds {uptime:.2f}")
+
+        return web.Response(
+            text="\n".join(lines) + "\n",
+            content_type="text/plain; charset=utf-8",
+        )
+
     async def health_check(self, request: web.Request) -> web.Response:
-        """Health check endpoint."""
+        """Full health check with component status."""
+        checks = {}
+        all_healthy = True
+
+        # Run registered health checks
+        for name, check in self._health_checks.items():
+            try:
+                if asyncio.iscoroutinefunction(check):
+                    result = await asyncio.wait_for(check(), timeout=5.0)
+                else:
+                    result = check()
+                checks[name] = {"status": "healthy" if result else "unhealthy"}
+                if not result:
+                    all_healthy = False
+            except asyncio.TimeoutError:
+                checks[name] = {"status": "timeout"}
+                all_healthy = False
+            except Exception as e:
+                checks[name] = {"status": "error", "message": str(e)}
+                all_healthy = False
+
+        uptime = (datetime.utcnow() - self._start_time).total_seconds()
+
+        response = {
+            "status": "healthy" if all_healthy else "unhealthy",
+            "service": "agentmesh-stm",
+            "timestamp": datetime.utcnow().isoformat(),
+            "uptime_seconds": uptime,
+            "ready": self._ready,
+            "checks": checks,
+        }
+
+        status_code = 200 if all_healthy else 503
+        return web.json_response(response, status=status_code)
+
+    async def simple_health(self, request: web.Request) -> web.Response:
+        """Simple health check for load balancers."""
         return web.json_response({
             "status": "healthy",
             "service": "agentmesh-stm",
         })
+
+    async def liveness_probe(self, request: web.Request) -> web.Response:
+        """Kubernetes liveness probe - check if service is alive."""
+        # Liveness just checks if the service is responding
+        return web.Response(text="OK", status=200)
+
+    async def readiness_probe(self, request: web.Request) -> web.Response:
+        """Kubernetes readiness probe - check if ready to serve traffic."""
+        if self._ready:
+            return web.Response(text="OK", status=200)
+        return web.Response(text="NOT READY", status=503)
 
 
 def create_app(config: Optional[APIConfig] = None) -> web.Application:
@@ -438,10 +542,11 @@ def create_app(config: Optional[APIConfig] = None) -> web.Application:
 
         app.middlewares.append(auth_middleware)
 
-    # Store config and manager in app
+    # Store config and components in app
     app["config"] = config
     app["manager"] = manager
     app["metrics"] = metrics
+    app["metrics_api"] = metrics_api
 
     logger.info(
         "API application created",
@@ -454,12 +559,14 @@ def create_app(config: Optional[APIConfig] = None) -> web.Application:
 
 
 async def run_server(config: Optional[APIConfig] = None) -> None:
-    """Run the API server."""
+    """Run the API server with graceful shutdown."""
     if not AIOHTTP_AVAILABLE:
         raise ImportError(
             "aiohttp is required for the API server. "
             "Install with: pip install aiohttp"
         )
+
+    import signal
 
     config = config or APIConfig()
     app = create_app(config)
@@ -479,11 +586,39 @@ async def run_server(config: Optional[APIConfig] = None) -> None:
     print(f"AgentMesh-STM API server running at http://{config.host}:{config.port}")
     print("Press Ctrl+C to stop")
 
-    # Keep running until interrupted
+    # Set up graceful shutdown
+    shutdown_event = asyncio.Event()
+
+    def signal_handler():
+        logger.info("Shutdown signal received")
+        shutdown_event.set()
+
+    # Install signal handlers
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+
+    # Wait for shutdown signal
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await shutdown_event.wait()
     except asyncio.CancelledError:
         pass
-    finally:
-        await runner.cleanup()
+
+    # Graceful shutdown
+    logger.info("Starting graceful shutdown...")
+
+    # Mark as not ready
+    if "metrics_api" in app:
+        app["metrics_api"].set_ready(False)
+
+    # Give time for health checks to propagate
+    await asyncio.sleep(2)
+
+    # Cleanup
+    logger.info("Cleaning up server resources...")
+    await runner.cleanup()
+    logger.info("Server shutdown complete")
